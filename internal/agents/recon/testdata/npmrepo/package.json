@@ -1,0 +1,7 @@
+{
+  "name": "demo",
+  "dependencies": {"alpha": "^1.2.3", "shared": "~2.0.0"},
+  "devDependencies": {"beta": ">=3 <4", "shared": "~2.0.0"},
+  "main": "./src/index.js",
+  "bin": {"demo": "bin/demo.js", "alias": "bin/demo.js"}
+}
