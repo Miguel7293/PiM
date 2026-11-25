@@ -18,7 +18,7 @@ Maps the attack surface, cross-references it with known vulnerabilities and deli
 ![Status](https://img.shields.io/badge/status-design%20phase-64748B?style=flat-square)
 ![Type](https://img.shields.io/badge/type-vulnerability%20assessment-2563EB?style=flat-square)
 ![Deployment](https://img.shields.io/badge/deployment-self--hosted-0F172A?style=flat-square)
-![License](https://img.shields.io/badge/license-TBD-lightgrey?style=flat-square)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-2563EB?style=flat-square)](LICENSE)
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Miguel%20Llusca-1E3A8A?style=flat-square&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/miguel-angel-llusca-surco/)
 
 [Overview](#what-is-pim) ·
@@ -314,7 +314,7 @@ PiM is in the **design phase**. There are no installation instructions yet.
 - [ ] Define the approach: white box (with source code) or black box
 - [ ] Define the main methodology for each type of target
 - [ ] Choose the language and implementation stack
-- [ ] Define the license model
+- [x] Define the license model
 - [ ] Set up a safe test environment (DVWA, OWASP Juice Shop)
 - [ ] Prototype the reconnaissance agent and the structure graph
 - [ ] Local mirror of NVD / OSV / KEV / EPSS
@@ -354,7 +354,7 @@ The project is at an early stage. Ideas, architecture reviews and issues are wel
 
 ## License
 
-To be defined.
+PiM is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).
 
 <br/>
 
@@ -633,7 +633,7 @@ PiM está en **fase de diseño**. Aún no hay instrucciones de instalación.
 - [ ] Definir el enfoque: caja blanca (con código fuente) o caja negra
 - [ ] Definir la metodología principal según el tipo de objetivo
 - [ ] Elegir lenguaje y stack de implementación
-- [ ] Definir el modelo de licencia
+- [x] Definir el modelo de licencia
 - [ ] Montar un entorno de pruebas seguro (DVWA, OWASP Juice Shop)
 - [ ] Prototipo del agente de reconocimiento y del grafo de estructura
 - [ ] Espejo local de NVD / OSV / KEV / EPSS
@@ -669,7 +669,7 @@ los issues son bienvenidos.
 
 ### Licencia
 
-Por definir.
+PiM se distribuye bajo la [Licencia Pública General Affero de GNU v3.0](LICENSE) (AGPL-3.0).
 
 <div align="center">
 <br/>
