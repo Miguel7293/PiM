@@ -26,6 +26,15 @@ CREATE TABLE lookups (
  result TEXT NOT NULL,
  PRIMARY KEY(ecosystem,package,version)
 );
+`, `
+DROP TABLE lookups;
+CREATE TABLE mirror_runs (
+ source TEXT NOT NULL,
+ ecosystem TEXT NOT NULL,
+ fetched_at TEXT NOT NULL,
+ vuln_count INTEGER NOT NULL
+);
+CREATE INDEX mirror_runs_ecosystem ON mirror_runs(source,ecosystem);
 `}
 
 func (s *SQLiteStore) migrate() error {

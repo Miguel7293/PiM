@@ -2,6 +2,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -9,11 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
 
-var ErrNotFound = errors.New("package version is not mirrored")
+var ErrNotFound = errors.New("ecosystem is not mirrored")
 
 type Package struct {
 	Ecosystem string `json:"ecosystem"`
@@ -50,7 +52,6 @@ type Range struct {
 
 type Store interface {
 	Lookup(Package, string) ([]Vuln, error)
-	Put(Package, string, []Vuln) error
 }
 
 type SQLiteStore struct{ db *sql.DB }
@@ -86,71 +87,107 @@ func Open(path string) (*SQLiteStore, error) {
 
 func (s *SQLiteStore) Close() error { return s.db.Close() }
 
-// Lookup never contacts a source. Only explicitly mirrored tuples are available;
-// ranges are retained as source evidence, not evaluated with guessed semantics.
+// Lookup evaluates only locally stored evidence and never contacts a source.
 func (s *SQLiteStore) Lookup(pkg Package, version string) ([]Vuln, error) {
 	if err := pkg.Validate(version); err != nil {
 		return nil, fmt.Errorf("lookup mirror: %w", err)
 	}
-	var data string
-	err := s.db.QueryRow(`SELECT result FROM lookups WHERE ecosystem=? AND package=? AND version=?`, pkg.Ecosystem, pkg.Name, version).Scan(&data)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("lookup mirror: %w", ErrNotFound)
-	}
+	tx, err := s.db.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("lookup mirror: %w", err)
+		return nil, fmt.Errorf("begin lookup: %w", err)
 	}
-	var result []Vuln
-	if err = json.Unmarshal([]byte(data), &result); err != nil {
-		return nil, fmt.Errorf("decode mirror: %w", err)
+	defer tx.Rollback()
+	var exists int
+	if err = tx.QueryRow(`SELECT 1 FROM mirror_runs WHERE source='OSV' AND ecosystem=? LIMIT 1`, pkg.Ecosystem).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("read mirror metadata: %w", err)
+	}
+	rows, err := tx.Query(`SELECT v.payload,a.ranges,a.versions FROM affected_packages a JOIN vulns v ON v.source=a.source AND v.id=a.vuln_id WHERE a.source='OSV' AND a.ecosystem=? AND a.package=? ORDER BY v.id`, pkg.Ecosystem, pkg.Name)
+	if err != nil {
+		return nil, fmt.Errorf("query affected packages: %w", err)
+	}
+	defer rows.Close()
+	result := []Vuln{}
+	seen := map[string]bool{}
+	for rows.Next() {
+		var payload, ranges, versions string
+		if err := rows.Scan(&payload, &ranges, &versions); err != nil {
+			return nil, fmt.Errorf("read affected package: %w", err)
+		}
+		a := Affected{Package: pkg}
+		var v Vuln
+		for _, item := range []struct {
+			data string
+			dst  any
+		}{{payload, &v}, {ranges, &a.Ranges}, {versions, &a.Versions}} {
+			if err := json.Unmarshal([]byte(item.data), item.dst); err != nil {
+				return nil, fmt.Errorf("decode mirror: %w", err)
+			}
+		}
+		if !seen[v.ID] && matches(a, version) {
+			result = append(result, v)
+			seen[v.ID] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read mirror: %w", err)
 	}
 	return result, nil
 }
 
-// Put atomically stores an OSV snapshot and its generic vulnerability records.
-// Separate lookup snapshots preserve the exact response for each mirrored tuple.
-func (s *SQLiteStore) Put(pkg Package, version string, vulns []Vuln) error {
-	if err := pkg.Validate(version); err != nil {
-		return fmt.Errorf("write mirror: %w", err)
+// ReplaceOSV consumes one record at a time in a single ecosystem transaction.
+// The producer must return any decoding error so the previous snapshot survives.
+func (s *SQLiteStore) ReplaceOSV(ctx context.Context, ecosystem string, produce func(func(Vuln) error) error) error {
+	if ecosystem != "Go" && ecosystem != "npm" {
+		return fmt.Errorf("unsupported ecosystem %q", ecosystem)
 	}
-	for _, v := range vulns {
-		if strings.TrimSpace(v.ID) == "" {
-			return errors.New("write mirror: empty vulnerability ID")
-		}
-	}
-	if vulns == nil {
-		vulns = []Vuln{}
-	}
-	data, err := json.Marshal(vulns)
-	if err != nil {
-		return fmt.Errorf("encode mirror: %w", err)
-	}
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin mirror update: %w", err)
 	}
 	defer tx.Rollback()
-	for _, v := range vulns {
-		payload, _ := json.Marshal(v)
-		if _, err = tx.Exec(`INSERT INTO vulns(source,id,payload) VALUES('OSV',?,?) ON CONFLICT(source,id) DO UPDATE SET payload=excluded.payload`, v.ID, string(payload)); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM affected_packages WHERE source='OSV' AND ecosystem=?`, ecosystem); err != nil {
+		return fmt.Errorf("clear ecosystem: %w", err)
+	}
+	count := 0
+	seen := map[string]bool{}
+	err = produce(func(v Vuln) error {
+		if strings.TrimSpace(v.ID) == "" || seen[v.ID] {
+			return fmt.Errorf("invalid or duplicate vulnerability ID %q", v.ID)
+		}
+		seen[v.ID] = true
+		payload, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("encode vulnerability: %w", err)
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO vulns(source,id,payload) VALUES('OSV',?,?) ON CONFLICT(source,id) DO UPDATE SET payload=excluded.payload`, v.ID, string(payload)); err != nil {
 			return fmt.Errorf("store vulnerability: %w", err)
 		}
-		if _, err = tx.Exec(`DELETE FROM affected_packages WHERE source='OSV' AND vuln_id=?`, v.ID); err != nil {
-			return fmt.Errorf("replace affected packages: %w", err)
-		}
 		for _, a := range v.Affected {
+			if a.Package.Ecosystem != ecosystem {
+				continue
+			}
+			if strings.TrimSpace(a.Package.Name) == "" {
+				return errors.New("empty affected package name")
+			}
 			ranges, _ := json.Marshal(a.Ranges)
 			versions, _ := json.Marshal(a.Versions)
-			if _, err = tx.Exec(`INSERT INTO affected_packages(source,vuln_id,ecosystem,package,ranges,versions) VALUES('OSV',?,?,?,?,?)`, v.ID, a.Package.Ecosystem, a.Package.Name, string(ranges), string(versions)); err != nil {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO affected_packages(source,vuln_id,ecosystem,package,ranges,versions) VALUES('OSV',?,?,?,?,?)`, v.ID, ecosystem, a.Package.Name, string(ranges), string(versions)); err != nil {
 				return fmt.Errorf("store affected package: %w", err)
 			}
 		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("replace OSV ecosystem: %w", err)
 	}
-	if _, err = tx.Exec(`INSERT INTO lookups(ecosystem,package,version,result) VALUES(?,?,?,?) ON CONFLICT(ecosystem,package,version) DO UPDATE SET result=excluded.result`, pkg.Ecosystem, pkg.Name, version, string(data)); err != nil {
-		return fmt.Errorf("store lookup: %w", err)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO mirror_runs(source,ecosystem,fetched_at,vuln_count) VALUES('OSV',?,?,?)`, ecosystem, time.Now().UTC().Format(time.RFC3339Nano), count); err != nil {
+		return fmt.Errorf("record mirror run: %w", err)
 	}
 	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit mirror update: %w", err)
+		return fmt.Errorf("commit mirror: %w", err)
 	}
 	return nil
 }

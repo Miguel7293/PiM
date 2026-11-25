@@ -1,106 +1,132 @@
-// Package sources downloads structured vulnerability data during explicit ingestion.
-// Assessment-time queries must use store.Store.Lookup instead.
+// Package sources downloads vulnerability data only during explicit ingestion.
 package sources
 
 import (
-	"bytes"
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/Miguel7293/PiM-/internal/store"
 )
 
-const OSVQueryURL = "https://api.osv.dev/v1/query"
+const OSVBulkURL = "https://osv-vulnerabilities.storage.googleapis.com"
 
-// OSVClient's zero value uses the public OSV endpoint and a bounded HTTP timeout.
-type OSVClient struct {
-	HTTPClient *http.Client
-	QueryURL   string
+// OSVBulk's zero value uses bounded downloads from the public ecosystem archive.
+// Limits set to zero use defaults; negative limits are rejected.
+type OSVBulk struct {
+	HTTPClient       *http.Client
+	BaseURL          string
+	MaxDownloadBytes int64
+	MaxEntryBytes    int64
+	MaxEntries       int
 }
 
-// Fetch sends package identity and version to OSV. Use only for explicit mirror
-// preparation with an approved catalog, never as an offline lookup fallback.
-func (c OSVClient) Fetch(ctx context.Context, pkg store.Package, version string) ([]store.Vuln, error) {
-	if err := pkg.Validate(version); err != nil {
-		return nil, fmt.Errorf("query OSV: %w", err)
+type BulkStore interface {
+	ReplaceOSV(context.Context, string, func(func(store.Vuln) error) error) error
+}
+
+// Ingest downloads an entire ecosystem without sending client dependencies.
+func (c OSVBulk) Ingest(ctx context.Context, dst BulkStore, ecosystem string) error {
+	if ecosystem != "Go" && ecosystem != "npm" {
+		return fmt.Errorf("unsupported ecosystem %q", ecosystem)
+	}
+	if c.MaxDownloadBytes < 0 || c.MaxEntryBytes < 0 || c.MaxEntries < 0 {
+		return fmt.Errorf("OSV limits must be nonnegative")
+	}
+	if c.MaxDownloadBytes == 0 {
+		c.MaxDownloadBytes = 1 << 30
+	}
+	if c.MaxEntryBytes == 0 {
+		c.MaxEntryBytes = 16 << 20
+	}
+	if c.MaxEntries == 0 {
+		c.MaxEntries = 1000000
 	}
 	client := c.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{Timeout: 10 * time.Minute}
 	}
-	endpoint := c.QueryURL
-	if endpoint == "" {
-		endpoint = OSVQueryURL
+	base := c.BaseURL
+	if base == "" {
+		base = OSVBulkURL
 	}
-	query := struct {
-		Package   store.Package `json:"package"`
-		Version   string        `json:"version"`
-		PageToken string        `json:"page_token,omitempty"`
-	}{Package: pkg, Version: version}
-	result := []store.Vuln{}
-	seen := map[string]bool{}
-	for {
-		body, err := json.Marshal(query)
-		if err != nil {
-			return nil, fmt.Errorf("encode OSV query: %w", err)
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("create OSV request: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("request OSV: %w", err)
-		}
-		data, readErr := io.ReadAll(io.LimitReader(resp.Body, (32<<20)+1))
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("query OSV: HTTP %d", resp.StatusCode)
-		}
-		if readErr != nil {
-			return nil, fmt.Errorf("read OSV response: %w", readErr)
-		}
-		if len(data) > 32<<20 {
-			return nil, fmt.Errorf("read OSV response: exceeds 32 MiB")
-		}
-		var page struct {
-			Vulns []store.Vuln `json:"vulns"`
-			Next  string       `json:"next_page_token"`
-		}
-		if err := json.Unmarshal(data, &page); err != nil {
-			return nil, fmt.Errorf("decode OSV response: %w", err)
-		}
-		for _, v := range page.Vulns {
-			if v.ID == "" {
-				return nil, fmt.Errorf("decode OSV response: empty vulnerability ID")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/"+ecosystem+"/all.zip", nil)
+	if err != nil {
+		return fmt.Errorf("create OSV request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("download OSV archive: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download OSV archive: HTTP %d", resp.StatusCode)
+	}
+	tmp, err := os.CreateTemp("", "pim-osv-*.zip")
+	if err != nil {
+		return fmt.Errorf("create OSV temporary archive: %w", err)
+	}
+	defer func() { tmp.Close(); os.Remove(tmp.Name()) }()
+	n, err := io.Copy(tmp, io.LimitReader(resp.Body, c.MaxDownloadBytes))
+	if err != nil {
+		return fmt.Errorf("download OSV archive: %w", err)
+	}
+	var extra [1]byte
+	more, err := io.ReadFull(resp.Body, extra[:])
+	if more != 0 {
+		return fmt.Errorf("OSV download exceeds size limit")
+	}
+	if err != io.EOF {
+		return fmt.Errorf("finish OSV download: %w", err)
+	}
+	archive, err := zip.NewReader(tmp, n)
+	if err != nil {
+		return fmt.Errorf("open OSV archive: %w", err)
+	}
+	if len(archive.File) > c.MaxEntries {
+		return fmt.Errorf("OSV archive exceeds entry count limit")
+	}
+	return dst.ReplaceOSV(ctx, ecosystem, func(emit func(store.Vuln) error) error {
+		for _, entry := range archive.File {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if entry.FileInfo().IsDir() {
+				continue
+			}
+			if entry.UncompressedSize64 > uint64(c.MaxEntryBytes) {
+				return fmt.Errorf("OSV entry exceeds size limit")
+			}
+			reader, err := entry.Open()
+			if err != nil {
+				return fmt.Errorf("open OSV entry: %w", err)
+			}
+			data, readErr := io.ReadAll(io.LimitReader(reader, c.MaxEntryBytes))
+			more, endErr := io.ReadFull(reader, extra[:])
+			reader.Close()
+			if readErr != nil {
+				return fmt.Errorf("read OSV entry: %w", readErr)
+			}
+			if more != 0 {
+				return fmt.Errorf("OSV entry exceeds size limit")
+			}
+			if endErr != io.EOF {
+				return fmt.Errorf("finish OSV entry: %w", endErr)
+			}
+			var v store.Vuln
+			if err := json.Unmarshal(data, &v); err != nil {
+				return fmt.Errorf("decode OSV entry: %w", err)
+			}
+			if err := emit(v); err != nil {
+				return err
 			}
 		}
-		result = append(result, page.Vulns...)
-		if page.Next == "" {
-			return result, nil
-		}
-		if seen[page.Next] {
-			return nil, fmt.Errorf("query OSV: repeated page token")
-		}
-		seen[page.Next] = true
-		query.PageToken = page.Next
-	}
-}
-
-// Refresh explicitly fetches all pages before replacing a mirrored result.
-// A failed download leaves the previously stored result intact.
-func (c OSVClient) Refresh(ctx context.Context, dst store.Store, pkg store.Package, version string) error {
-	vulns, err := c.Fetch(ctx, pkg, version)
-	if err != nil {
-		return err
-	}
-	if err := dst.Put(pkg, version, vulns); err != nil {
-		return fmt.Errorf("refresh OSV mirror: %w", err)
-	}
-	return nil
+		return nil
+	})
 }
