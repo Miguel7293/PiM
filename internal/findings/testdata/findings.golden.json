@@ -1,0 +1,65 @@
+{
+  "findings": [
+    {
+      "id": "a",
+      "component_id": "dependency:npm:lodash@4.17.20",
+      "vuln_id": "CVE-2021-23337",
+      "aliases": [
+        "alias"
+      ],
+      "severity": "high",
+      "score": {},
+      "techniques": [
+        {
+          "framework": "CWE",
+          "id": "CWE-78",
+          "name": ""
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "advisory",
+          "source": "source",
+          "detail": "",
+          "location": ""
+        }
+      ],
+      "status": "candidate",
+      "agent": "collector"
+    },
+    {
+      "id": "b",
+      "component_id": "dependency:npm:lodash@4.17.20",
+      "vuln_id": "CVE-2021-23337",
+      "aliases": [
+        "a",
+        "z"
+      ],
+      "severity": "high",
+      "score": {},
+      "techniques": [
+        {
+          "framework": "CWE",
+          "id": "CWE-78",
+          "name": ""
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "advisory",
+          "source": "source",
+          "detail": "",
+          "location": ""
+        },
+        {
+          "kind": "model",
+          "source": "",
+          "detail": "model claim",
+          "location": ""
+        }
+      ],
+      "status": "candidate",
+      "agent": "collector"
+    }
+  ]
+}
