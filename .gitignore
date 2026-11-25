@@ -1,0 +1,67 @@
+# ============================================================
+#  PiM / PoM — .gitignore
+# ============================================================
+
+# ----- Secretos y configuración local --------------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+config.local.*
+
+# ----- Espejo local de vulnerabilidades ------------------------------
+# NVD / OSV / GHSA / KEV / EPSS: pesado y re-descargable.
+data/mirror/
+data/raw/
+*.sqlite
+*.sqlite3
+*.db
+*.duckdb
+
+# ----- Salidas de escaneo e informes ---------------------------------
+# Pueden contener información sensible del objetivo.
+reports/
+output/
+scans/
+*.sarif
+grafo_*.json
+grafo_*.svg
+
+# ----- PoM: artefactos de sandbox ------------------------------------
+sandbox/
+pom_runs/
+*.pcap
+
+# ----- Go ------------------------------------------------------------
+/pim
+/pim.exe
+bin/
+*.exe
+*.test
+*.out
+
+# ----- Python (sidecar de analítica) ---------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# ----- Node / frontend (cuando exista la UI) -------------------------
+node_modules/
+dist-ui/
+.vite/
+.next/
+
+# ----- Editores y sistema operativo ----------------------------------
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
