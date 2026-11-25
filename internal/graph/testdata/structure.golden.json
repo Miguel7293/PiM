@@ -1,0 +1,35 @@
+{
+  "nodes": [
+    {
+      "id": "component:go:example/app",
+      "kind": "component",
+      "label": "example/app"
+    },
+    {
+      "id": "dependency:go:example/lib@v1.2.3",
+      "kind": "dependency",
+      "label": "example/lib",
+      "attrs": {
+        "ecosystem": "go",
+        "version": "v1.2.3"
+      }
+    },
+    {
+      "id": "entrypoint:go:cmd/app",
+      "kind": "entrypoint",
+      "label": "cmd/app"
+    }
+  ],
+  "edges": [
+    {
+      "from": "component:go:example/app",
+      "to": "dependency:go:example/lib@v1.2.3",
+      "kind": "depends_on"
+    },
+    {
+      "from": "component:go:example/app",
+      "to": "entrypoint:go:cmd/app",
+      "kind": "exposes"
+    }
+  ]
+}
