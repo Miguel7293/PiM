@@ -1,135 +1,130 @@
 package sources
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 
 	"github.com/Miguel7293/PiM-/internal/store"
 )
 
-func TestRefreshAndOfflineLookup(t *testing.T) {
-	fixture, err := os.ReadFile("testdata/osv-query.json")
-	if err != nil {
+const record = `{"id":"test","affected":[{"package":{"ecosystem":"Go","name":"demo"},"ranges":[{"type":"SEMVER","events":[{"introduced":"1.0.0"},{"fixed":"2.0.0"}]}]}]}`
+
+func archiveFixture(t *testing.T, records ...string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := zip.NewWriter(&buf)
+	for i, r := range records {
+		f, err := w.Create(fmt.Sprintf("%d.json", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.Write([]byte(r)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	pkg := store.Package{Ecosystem: "npm", Name: "@example/demo"}
+	return buf.Bytes()
+}
+func TestBulkIngest(t *testing.T) {
+	body := archiveFixture(t, record)
+	status := 200
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "application/json" {
-			t.Error("invalid request headers")
+		if r.Method != "GET" || r.URL.Path != "/Go/all.zip" || r.URL.RawQuery != "" || r.ContentLength > 0 {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
 		}
-		var query struct {
-			Package store.Package
-			Version string
-			Token   string `json:"page_token"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&query); err != nil {
-			t.Error(err)
-		}
-		if query.Package != pkg || query.Version != "1.0.0" {
-			t.Errorf("unexpected query: %+v", query)
-		}
-		if calls == 1 {
-			if query.Token != "" {
-				t.Error("unexpected initial token")
-			}
-			w.Write(fixture)
-		} else {
-			if query.Token != "page-2" {
-				t.Error("missing pagination token")
-			}
-			w.Write([]byte(`{"vulns":[{"id":"OSV-test-0002"}]}`))
-		}
+		w.WriteHeader(status)
+		w.Write(body)
 	}))
-	t.Cleanup(server.Close)
-	dir := filepath.Join(t.TempDir(), "pim.db")
-	dst, err := store.Open(dir)
+	defer server.Close()
+	path := filepath.Join(t.TempDir(), "mirror.db")
+	dst, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := OSVClient{HTTPClient: server.Client(), QueryURL: server.URL}
-	if err := client.Refresh(context.Background(), dst, pkg, "1.0.0"); err != nil {
+	defer func() { dst.Close() }()
+	client := OSVBulk{BaseURL: server.URL, HTTPClient: server.Client()}
+	if err = client.Ingest(context.Background(), dst, "Go"); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 2 {
-		t.Fatalf("got %d requests", calls)
-	}
-	server.Close()
-	if err := dst.Close(); err != nil {
+	if err = dst.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := store.Open(dir)
+	dst, err = store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
-	want := []store.Vuln{{ID: "GHSA-test-0001", Aliases: []string{"CVE-2026-0001"}, Summary: "Synthetic fixture vulnerability"}, {ID: "OSV-test-0002"}}
-	got, err := reopened.Lookup(pkg, "1.0.0")
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Fatalf("lookup = %+v, %v", got, err)
-	}
-	if _, err := reopened.Lookup(pkg, "2.0.0"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("miss = %v", err)
-	}
-}
-
-func TestFetchFailuresPreserveMirror(t *testing.T) {
+	pkg := store.Package{Ecosystem: "Go", Name: "demo"}
 	for _, tc := range []struct {
-		name, body string
-		status     int
+		name            string
+		body            []byte
+		status          int
+		download, entry int64
+		entries         int
 	}{
-		{"http", `{}`, 503},
-		{"json", `{`, 200},
-		{"missing ID", `{"vulns":[{}]}`, 200},
-		{"repeated token", `{"next_page_token":"same"}`, 200},
+		{"http", nil, 503, 0, 0, 0},
+		{"corrupt", []byte("bad zip"), 200, 0, 0, 0},
+		{"download", archiveFixture(t, record), 200, 10, 0, 0},
+		{"entry", archiveFixture(t, record), 200, 0, 10, 0},
+		{"count", archiveFixture(t, record, record), 200, 0, 0, 1},
+		{"late JSON", archiveFixture(t, record, "{"), 200, 0, 0, 0},
+		{"late ID", archiveFixture(t, record, "{}"), 200, 0, 0, 0},
+		{"duplicate", archiveFixture(t, record, record), 200, 0, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status); w.Write([]byte(tc.body)) }))
-			defer server.Close()
-			dst, err := store.Open(filepath.Join(t.TempDir(), "pim.db"))
-			if err != nil {
-				t.Fatal(err)
+			body, status = tc.body, tc.status
+			c := client
+			c.MaxDownloadBytes = tc.download
+			c.MaxEntryBytes = tc.entry
+			c.MaxEntries = tc.entries
+			if err := c.Ingest(context.Background(), dst, "Go"); err == nil {
+				t.Fatal("expected failure")
 			}
-			defer dst.Close()
-			pkg := store.Package{Ecosystem: "Go", Name: "example.org/demo"}
-			if err := dst.Put(pkg, "v1", []store.Vuln{{ID: "old"}}); err != nil {
-				t.Fatal(err)
-			}
-			client := OSVClient{HTTPClient: server.Client(), QueryURL: server.URL}
-			if err := client.Refresh(context.Background(), dst, pkg, "v1"); err == nil {
-				t.Fatal("expected error")
-			}
-			got, err := dst.Lookup(pkg, "v1")
-			if err != nil || len(got) != 1 || got[0].ID != "old" {
-				t.Fatalf("old entry lost: %v, %v", got, err)
+			got, err := dst.Lookup(pkg, "v1.5.0")
+			if err != nil || len(got) != 1 || got[0].ID != "test" {
+				t.Fatalf("lost snapshot: %v %v", got, err)
 			}
 		})
 	}
-}
-
-func TestFetchEmptyAndCanceled(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte(`{}`)) }))
-	defer server.Close()
-	client := OSVClient{HTTPClient: server.Client(), QueryURL: server.URL}
-	pkg := store.Package{Ecosystem: "npm", Name: "demo"}
-	got, err := client.Fetch(context.Background(), pkg, "1")
-	if err != nil || len(got) != 0 {
-		t.Fatalf("empty response = %v, %v", got, err)
+	before := calls
+	for _, version := range []string{"0.9.0", "2.0.0"} {
+		got, err := dst.Lookup(pkg, version)
+		if err != nil || got == nil || len(got) != 0 {
+			t.Fatalf("lookup: %v %v", got, err)
+		}
+	}
+	if calls != before {
+		t.Fatal("lookup used HTTP")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := client.Fetch(ctx, pkg, "1"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("canceled = %v", err)
+	if err = client.Ingest(ctx, dst, "Go"); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
 	}
-	if _, err := client.Fetch(context.Background(), store.Package{}, ""); err == nil {
-		t.Fatal("expected validation error")
+	if err = client.Ingest(context.Background(), dst, "PyPI"); err == nil {
+		t.Fatal("unsupported ecosystem accepted")
+	}
+	invalid := client
+	invalid.MaxEntries = -1
+	if err = invalid.Ingest(context.Background(), dst, "Go"); err == nil {
+		t.Fatal("invalid limit accepted")
+	}
+	body, status = archiveFixture(t), 200
+	if err = client.Ingest(context.Background(), dst, "Go"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dst.Lookup(pkg, "1.5.0")
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("empty snapshot: %v %v", got, err)
 	}
 }

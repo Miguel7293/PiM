@@ -1,122 +1,122 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"errors"
-	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 )
 
-func TestPersistenceAndKeys(t *testing.T) {
+func replace(s *SQLiteStore, eco string, vs ...Vuln) error {
+	return s.ReplaceOSV(context.Background(), eco, func(emit func(Vuln) error) error {
+		for _, v := range vs {
+			if err := emit(v); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+func fixture(id, eco string) Vuln {
+	return Vuln{ID: id, Affected: []Affected{{Package: Package{eco, "demo"}, Versions: []string{"1.0.0"}}}}
+}
+func TestSnapshots(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "mirror.db")
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pkg := Package{"npm", "../../@scope/demo"}
-	want := []Vuln{{ID: "GHSA-test", Aliases: []string{"CVE-test"}, Affected: []Affected{{Package: pkg, Ranges: []Range{{Type: "SEMVER", Events: []map[string]string{{"introduced": "0"}, {"fixed": "2"}}}}, Versions: []string{"1"}}}}}
-	if err = s.Put(pkg, "1", want); err != nil {
+	if _, err = s.Lookup(Package{"Go", "demo"}, "1.0.0"); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
+	}
+	for _, eco := range []string{"Go", "npm"} {
+		if err = replace(s, eco, fixture("shared", eco)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = replace(s, "Go", fixture("new", "Go"), Vuln{}); err == nil {
+		t.Fatal("expected rollback")
 	}
 	if err = s.Close(); err != nil {
 		t.Fatal(err)
-	}
-	header, err := os.ReadFile(path)
-	if err != nil || string(header[:16]) != "SQLite format 3\x00" {
-		t.Fatalf("not SQLite: %v", err)
 	}
 	s, err = Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	got, err := s.Lookup(pkg, "1")
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Fatalf("lookup = %#v, %v", got, err)
-	}
-	for _, key := range []struct {
-		pkg     Package
-		version string
-	}{{pkg, "2"}, {Package{"PyPI", pkg.Name}, "1"}, {Package{"npm", "other"}, "1"}} {
-		if _, err = s.Lookup(key.pkg, key.version); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("miss = %v", err)
+	for _, eco := range []string{"Go", "npm"} {
+		got, err := s.Lookup(Package{eco, "demo"}, "1.0.0")
+		if err != nil || len(got) != 1 || got[0].ID != "shared" {
+			t.Fatalf("snapshot: %v %v", got, err)
 		}
 	}
-	var count int
-	if err = s.db.QueryRow(`SELECT count(*) FROM affected_packages WHERE ecosystem='npm' AND ranges LIKE '%fixed%'`).Scan(&count); err != nil || count != 1 {
-		t.Fatalf("affected = %d, %v", count, err)
-	}
-	if err = s.db.QueryRow(`SELECT count(*) FROM schema_version WHERE version=1`).Scan(&count); err != nil || count != 1 {
-		t.Fatalf("migration = %d, %v", count, err)
-	}
-	if err = s.Put(pkg, "1", nil); err != nil {
+	if err = replace(s, "Go"); err != nil {
 		t.Fatal(err)
 	}
-	got, err = s.Lookup(pkg, "1")
+	got, err := s.Lookup(Package{"Go", "demo"}, "1.0.0")
 	if err != nil || got == nil || len(got) != 0 {
-		t.Fatalf("empty = %v, %v", got, err)
+		t.Fatalf("empty: %v %v", got, err)
+	}
+	got, err = s.Lookup(Package{"npm", "demo"}, "1.0.0")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("other ecosystem lost: %v %v", got, err)
+	}
+	var count int
+	if err = s.db.QueryRow(`SELECT count(*) FROM mirror_runs`).Scan(&count); err != nil || count != 3 {
+		t.Fatalf("runs: %d %v", count, err)
+	}
+	if _, err = s.Lookup(Package{}, ""); err == nil {
+		t.Fatal("invalid package accepted")
+	}
+	if err = replace(s, "PyPI"); err == nil {
+		t.Fatal("unsupported ecosystem accepted")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err = s.ReplaceOSV(ctx, "Go", func(func(Vuln) error) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
 	}
 }
-
-func TestDefaultPathAndValidation(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("PIM_DATA_DIR", dir)
-	s, err := Open("")
+func TestMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-	if _, err = os.Stat(filepath.Join(dir, "pim.db")); err != nil {
+	if _, err = db.Exec(migrations[0] + `CREATE TABLE schema_version(version INTEGER PRIMARY KEY); INSERT INTO schema_version VALUES(1); INSERT INTO vulns VALUES('OSV','old','{"id":"old"}');`); err != nil {
 		t.Fatal(err)
 	}
-	for _, pkg := range []Package{{}, {"npm", ""}, {"", "demo"}} {
-		if err = s.Put(pkg, "1", nil); err == nil {
-			t.Fatal("expected validation error")
-		}
-		if _, err = s.Lookup(pkg, "1"); err == nil {
-			t.Fatal("expected validation error")
-		}
-	}
-	pkg := Package{"npm", "demo"}
-	if err = s.Put(pkg, "", nil); err == nil {
-		t.Fatal("expected version error")
-	}
-	if err = s.Put(pkg, "1", []Vuln{{}}); err == nil {
-		t.Fatal("expected ID error")
-	}
-}
-
-func TestRollbackAndFutureSchema(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "pim.db")
+	db.Close()
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	pkg := Package{"Go", "example.org/demo"}
-	if err = s.Put(pkg, "1", []Vuln{{ID: "old"}}); err != nil {
+	var id string
+	if err = s.db.QueryRow(`SELECT id FROM vulns`).Scan(&id); err != nil || id != "old" {
+		t.Fatalf("vuln lost: %s %v", id, err)
+	}
+	if _, err = s.db.Exec(`SELECT * FROM lookups`); err == nil {
+		t.Fatal("lookups still exists")
+	}
+	if _, err = s.Lookup(Package{"Go", "demo"}, "1.0.0"); !errors.Is(err, ErrNotFound) {
 		t.Fatal(err)
-	}
-	if _, err = s.db.Exec(`CREATE TRIGGER reject_lookup BEFORE UPDATE ON lookups BEGIN SELECT RAISE(ABORT,'test failure'); END;`); err != nil {
-		t.Fatal(err)
-	}
-	if err = s.Put(pkg, "1", []Vuln{{ID: "new"}}); err == nil {
-		t.Fatal("expected transaction failure")
-	}
-	got, err := s.Lookup(pkg, "1")
-	if err != nil || len(got) != 1 || got[0].ID != "old" {
-		t.Fatalf("old snapshot lost: %v %v", got, err)
-	}
-	var count int
-	if err = s.db.QueryRow(`SELECT count(*) FROM vulns WHERE id='new'`).Scan(&count); err != nil || count != 0 {
-		t.Fatalf("partial write: %d %v", count, err)
 	}
 	if _, err = s.db.Exec(`INSERT INTO schema_version VALUES(999)`); err != nil {
 		t.Fatal(err)
 	}
 	if other, err := Open(path); err == nil {
 		other.Close()
-		t.Fatal("expected unsupported schema error")
+		t.Fatal("future schema accepted")
 	}
+}
+func TestDefaultPath(t *testing.T) {
+	t.Setenv("PIM_DATA_DIR", t.TempDir())
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
 }
